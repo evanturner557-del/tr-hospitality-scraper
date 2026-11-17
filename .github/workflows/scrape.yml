@@ -1,0 +1,49 @@
+name: scrape
+on:
+  workflow_dispatch:
+    inputs:
+      shards: { description: "total shards", default: "40" }
+      only_shard: { description: "run just this shard (-1 = all)", default: "-1" }
+      max_queries: { description: "cap queries per shard (0 = no cap)", default: "0" }
+      depth: { description: "scroll depth per query", default: "4" }
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs: { matrix: "${{ steps.m.outputs.matrix }}" }
+    steps:
+      - id: m
+        run: |
+          if [ "${{ inputs.only_shard }}" != "-1" ]; then echo "matrix=[${{ inputs.only_shard }}]" >> $GITHUB_OUTPUT
+          else echo "matrix=$(python3 -c "print(list(range(${{ inputs.shards }})))")" >> $GITHUB_OUTPUT; fi
+  scrape:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: { shard: "${{ fromJson(needs.plan.outputs.matrix) }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: shard queries
+        run: |
+          mkdir -p out
+          awk -v n=${{ inputs.shards }} -v s=${{ matrix.shard }} 'NR%n==s' queries.txt > out/q.txt
+          if [ "${{ inputs.max_queries }}" != "0" ]; then head -n ${{ inputs.max_queries }} out/q.txt > out/q2 && mv out/q2 out/q.txt; fi
+          wc -l out/q.txt
+      - name: run scraper
+        timeout-minutes: 320
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD/out:/out" gosom/google-maps-scraper \
+            -input /out/q.txt -results /out/results.csv -depth ${{ inputs.depth }} \
+            -email -lang tr -c 6 -exit-on-inactivity 6m
+      - name: encrypt
+        if: always()
+        env: { KEY: "${{ secrets.RESULTS_KEY }}" }
+        run: |
+          ls -la out; wc -l out/results.csv || true
+          tar czf r.tgz -C out . && openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:KEY -in r.tgz -out results-${{ matrix.shard }}.enc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "shard-${{ matrix.shard }}", path: "results-${{ matrix.shard }}.enc", retention-days: 14 }
