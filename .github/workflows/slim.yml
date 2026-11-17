@@ -1,0 +1,43 @@
+name: slim
+on:
+  workflow_dispatch:
+    inputs:
+      run_id: { description: "scrape run id", required: true }
+permissions: { actions: read, contents: read }
+jobs:
+  slim:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { run-id: "${{ inputs.run_id }}", github-token: "${{ github.token }}", path: art }
+      - name: decrypt + slim + re-encrypt
+        env: { KEY: "${{ secrets.RESULTS_KEY }}" }
+        run: |
+          mkdir -p dec
+          for f in art/*/*.enc; do d=dec/$(basename $f .enc); mkdir -p $d; openssl enc -d -aes-256-cbc -pbkdf2 -pass env:KEY -in $f | tar xz -C $d || true; done
+          python3 - <<'EOF'
+          import csv, glob, json, re, sys
+          csv.field_size_limit(10**9)
+          L = re.compile(r"otel|hotel|pansiyon|hostel|konaklama|tatil|kamp|camp|bungalov|bungalow|motel|misafirhane|konuk ?evi|apart|glamping|karavan|yatak ve kahvalt|bed & breakfast|dağ evi|resort|lodge|guest ?house|inn\b|villa", re.I)
+          N = re.compile(r"malzeme|tedarik|acente|danışman|okul|mobilya|tekstil|ekipman|mağaza|satış|emlak|inşaat|restoran|kafe|cafe|market|kuaför|düğün|eczane|hastane|cami", re.I)
+          seen, out = set(), []
+          for f in glob.glob("dec/*/results.csv"):
+              for r in csv.DictReader(open(f, encoding="utf-8", errors="ignore")):
+                  c = r.get("category", "")
+                  if not (L.search(c) or (not c and L.search(r.get("title", "")))) or N.search(c): continue
+                  pid = r.get("place_id") or r.get("cid") or r.get("link")
+                  if pid in seen: continue
+                  seen.add(pid)
+                  try: ca = json.loads(r.get("complete_address") or "{}")
+                  except Exception: ca = {}
+                  out.append({"name": r["title"], "category": c, "phone": r["phone"], "website": r["website"], "emails": r.get("emails", ""),
+                              "address": r["address"], "district": ca.get("borough", ""), "city": ca.get("city", ""), "province": ca.get("state", ""),
+                              "rating": r.get("review_rating", ""), "reviews": r.get("review_count", ""), "lat": r["latitude"], "lon": r["longitude"],
+                              "gmaps_link": r["link"], "place_id": pid})
+          with open("gmaps_lodging.csv", "w", newline="", encoding="utf-8") as fo:
+              w = csv.DictWriter(fo, fieldnames=list(out[0].keys())); w.writeheader(); w.writerows(out)
+          print("lodging rows", len(out), "phone", sum(1 for r in out if r["phone"]), "email", sum(1 for r in out if r["emails"]), "web", sum(1 for r in out if r["website"]))
+          EOF
+          gzip -9 gmaps_lodging.csv && openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:KEY -in gmaps_lodging.csv.gz -out gmaps_lodging.enc && ls -la gmaps_lodging.enc
+      - uses: actions/upload-artifact@v4
+        with: { name: gmaps-lodging, path: gmaps_lodging.enc, retention-days: 30 }
